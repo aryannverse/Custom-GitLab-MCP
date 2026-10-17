@@ -1,0 +1,643 @@
+/**
+ * Toolset Filtering Test Suite
+ *
+ * Tests GITLAB_TOOLSETS, GITLAB_TOOLS, and their interaction with
+ * legacy flags (USE_GITLAB_WIKI, USE_PIPELINE, USE_MILESTONE),
+ * GITLAB_READ_ONLY_MODE, and GITLAB_DENIED_TOOLS_REGEX.
+ */
+
+import { describe, test, after, before } from "node:test";
+import assert from "node:assert";
+import {
+  launchServer,
+  findAvailablePort,
+  cleanupServers,
+  ServerInstance,
+  TransportMode,
+  HOST,
+} from "./utils/server-launcher.js";
+import {
+  MockGitLabServer,
+  findMockServerPort,
+} from "./utils/mock-gitlab-server.js";
+import { CustomHeaderClient } from "./clients/custom-header-client.js";
+
+const MOCK_TOKEN = "glpat-toolset-test-token";
+
+// Port bases (offset from other test suites to avoid collisions)
+const MOCK_PORT_BASE = 9200;
+const MCP_PORT_BASE = 3200;
+
+// Known tool counts per toolset (from TOOLSET_DEFINITIONS)
+const TOOLSET_TOOL_COUNTS: Record<string, number> = {
+  merge_requests: 41,
+  issues: 24,
+  repositories: 7,
+  branches: 15,
+  projects: 10,
+  labels: 5,
+  ci: 4,
+  pipelines: 19,
+  milestones: 17,
+  wiki: 10,
+  releases: 7,
+  tags: 5,
+  users: 7,
+  search: 3,
+  workitems: 18,
+  webhooks: 3,
+  groups: 1,
+  variables: 10,
+  dependency_proxy: 4,
+};
+
+const LEGACY_PIPELINE_CI_TOOL_COUNT = 2;
+const LEGACY_PIPELINE_TOOL_COUNT = TOOLSET_TOOL_COUNTS.pipelines + LEGACY_PIPELINE_CI_TOOL_COUNT;
+
+const DEFAULT_TOOLSETS = [
+  "merge_requests",
+  "issues",
+  "repositories",
+  "branches",
+  "projects",
+  "labels",
+  "ci",
+  "users",
+  "groups",
+];
+
+const NON_DEFAULT_TOOLSETS = [
+  "pipelines",
+  "milestones",
+  "wiki",
+  "releases",
+  "tags",
+  "workitems",
+  "webhooks",
+  "search",
+  "variables",
+  "dependency_proxy",
+];
+
+// discover_tools meta-tool is always force-injected (Step 5.5)
+const DISCOVER_TOOLS_COUNT = 1;
+
+const DEFAULT_TOOL_COUNT = DEFAULT_TOOLSETS.reduce(
+  (sum, id) => sum + TOOLSET_TOOL_COUNTS[id],
+  0
+) + DISCOVER_TOOLS_COUNT;
+
+const ALL_TOOLSET_TOOL_COUNT = Object.values(TOOLSET_TOOL_COUNTS).reduce(
+  (sum, c) => sum + c,
+  0
+) + DISCOVER_TOOLS_COUNT;
+
+// Representative tools per toolset for spot-checking
+const TOOLSET_SAMPLE_TOOLS: Record<string, string[]> = {
+  merge_requests: ["merge_merge_request", "create_merge_request_thread", "list_draft_notes"],
+  issues: ["create_issue", "list_issues", "create_note", "list_todos"],
+  repositories: ["search_repositories", "get_file_contents", "push_files"],
+  branches: ["create_branch", "get_branch", "list_branches", "delete_branch", "list_commits", "list_commit_statuses", "create_commit_status"],
+  projects: ["get_project", "update_project", "list_namespaces", "list_group_iterations"],
+  labels: ["list_labels", "create_label"],
+  ci: ["validate_ci_lint", "validate_project_ci_lint", "list_ci_catalog_resources", "get_ci_catalog_resource"],
+  pipelines: ["list_pipelines", "create_pipeline", "cancel_pipeline_job", "list_deployments", "list_job_artifacts"],
+  milestones: ["list_milestones", "create_milestone", "list_group_milestones", "get_group_milestone_burndown_events"],
+  wiki: ["list_wiki_pages", "create_wiki_page", "list_group_wiki_pages", "create_group_wiki_page"],
+  releases: ["list_releases", "create_release", "download_release_asset"],
+  tags: ["list_tags", "create_tag", "get_tag_signature"],
+  users: ["get_users", "upload_markdown", "download_attachment"],
+  search: ["search_code", "search_project_code", "search_group_code"],
+  webhooks: ["list_webhooks", "list_webhook_events", "get_webhook_event"],
+  groups: ["create_group"],
+  variables: ["list_project_variables", "create_project_variable", "delete_project_variable", "list_group_variables", "create_group_variable", "delete_group_variable"],
+  dependency_proxy: ["get_dependency_proxy_settings", "list_dependency_proxy_blobs", "purge_dependency_proxy_cache"],
+};
+
+// --- Helpers ---
+
+async function launchMcpServer(
+  mockGitLabUrl: string,
+  mcpPort: number,
+  extraEnv: Record<string, string> = {}
+): Promise<ServerInstance> {
+  return launchServer({
+    mode: TransportMode.STREAMABLE_HTTP,
+    port: mcpPort,
+    timeout: 10000,
+    env: {
+      STREAMABLE_HTTP: "true",
+      REMOTE_AUTHORIZATION: "true",
+      GITLAB_API_URL: `${mockGitLabUrl}/api/v4`,
+      ...extraEnv,
+    },
+  });
+}
+
+async function getToolNames(mcpUrl: string): Promise<string[]> {
+  const client = new CustomHeaderClient({
+    authorization: `Bearer ${MOCK_TOKEN}`,
+  });
+  await client.connect(mcpUrl);
+  const result = await client.listTools();
+  await client.disconnect();
+  return result.tools.map((t: { name: string }) => t.name);
+}
+
+function assertContainsAll(actual: string[], expected: string[], label: string) {
+  for (const name of expected) {
+    assert.ok(actual.includes(name), `${label}: expected tool "${name}" to be present`);
+  }
+}
+
+function assertContainsNone(actual: string[], excluded: string[], label: string) {
+  for (const name of excluded) {
+    assert.ok(!actual.includes(name), `${label}: expected tool "${name}" to be absent`);
+  }
+}
+
+// --- Tests ---
+
+let mockGitLab: MockGitLabServer;
+let mockGitLabUrl: string;
+let portCounter = 0;
+
+async function nextMcpPort(): Promise<number> {
+  return findAvailablePort(MCP_PORT_BASE + portCounter++ * 10);
+}
+
+describe("Toolset Filtering", { concurrency: 1 }, () => {
+  before(async () => {
+    const mockPort = await findMockServerPort();
+    mockGitLab = new MockGitLabServer({
+      port: mockPort,
+      validTokens: [MOCK_TOKEN],
+    });
+    await mockGitLab.start();
+    mockGitLabUrl = mockGitLab.getUrl();
+    console.log(`Mock GitLab: ${mockGitLabUrl}`);
+  });
+
+  after(async () => {
+    if (mockGitLab) await mockGitLab.stop();
+  });
+
+  // ---- 1. Default behavior (no GITLAB_TOOLSETS / GITLAB_TOOLS) ----
+
+  describe("defaults (no GITLAB_TOOLSETS)", () => {
+    let server: ServerInstance;
+    let tools: string[];
+
+    before(async () => {
+      const port = await nextMcpPort();
+      server = await launchMcpServer(mockGitLabUrl, port);
+      tools = await getToolNames(`http://${HOST}:${port}/mcp`);
+    });
+
+    after(() => cleanupServers([server]));
+
+    test("returns expected default tool count", () => {
+      assert.strictEqual(tools.length, DEFAULT_TOOL_COUNT);
+    });
+
+    test("includes tools from every default toolset", () => {
+      for (const id of DEFAULT_TOOLSETS) {
+        assertContainsAll(tools, TOOLSET_SAMPLE_TOOLS[id], id);
+      }
+    });
+
+    test("excludes non-default toolsets (search, pipelines, wiki)", () => {
+      assertContainsNone(tools, TOOLSET_SAMPLE_TOOLS.search, "non-default search");
+      assertContainsNone(tools, TOOLSET_SAMPLE_TOOLS.pipelines, "non-default pipelines");
+      assertContainsNone(tools, TOOLSET_SAMPLE_TOOLS.wiki, "non-default wiki");
+    });
+
+    test("excludes execute_graphql (not in any toolset)", () => {
+      assertContainsNone(tools, ["execute_graphql"], "unassigned");
+    });
+  });
+
+  // ---- 2. Single toolset ----
+
+  describe("GITLAB_TOOLSETS=issues", () => {
+    let server: ServerInstance;
+    let tools: string[];
+
+    before(async () => {
+      const port = await nextMcpPort();
+      server = await launchMcpServer(mockGitLabUrl, port, {
+        GITLAB_TOOLSETS: "issues",
+      });
+      tools = await getToolNames(`http://${HOST}:${port}/mcp`);
+    });
+
+    after(() => cleanupServers([server]));
+
+    test("returns only issue tools + discover_tools", () => {
+      assert.strictEqual(tools.length, TOOLSET_TOOL_COUNTS.issues + DISCOVER_TOOLS_COUNT);
+    });
+
+    test("includes issue sample tools", () => {
+      assertContainsAll(tools, TOOLSET_SAMPLE_TOOLS.issues, "issues");
+    });
+
+    test("excludes merge_requests tools", () => {
+      assertContainsNone(tools, TOOLSET_SAMPLE_TOOLS.merge_requests, "merge_requests");
+    });
+  });
+
+  // ---- 3. GITLAB_TOOLSETS=all ----
+
+  describe("GITLAB_TOOLSETS=all", () => {
+    let server: ServerInstance;
+    let tools: string[];
+
+    before(async () => {
+      const port = await nextMcpPort();
+      server = await launchMcpServer(mockGitLabUrl, port, {
+        GITLAB_TOOLSETS: "all",
+      });
+      tools = await getToolNames(`http://${HOST}:${port}/mcp`);
+    });
+
+    after(() => cleanupServers([server]));
+
+    test("returns all toolset tools", () => {
+      assert.strictEqual(tools.length, ALL_TOOLSET_TOOL_COUNT);
+    });
+
+    test("includes pipelines, milestones, and wiki", () => {
+      for (const id of ["pipelines", "milestones", "wiki"]) {
+        assertContainsAll(tools, TOOLSET_SAMPLE_TOOLS[id], id);
+      }
+    });
+
+    test("still excludes execute_graphql", () => {
+      assertContainsNone(tools, ["execute_graphql"], "unassigned");
+    });
+  });
+
+  // ---- 4. GITLAB_TOOLS (individual tools, additive) ----
+
+  describe("GITLAB_TOOLS=list_pipelines,execute_graphql", () => {
+    let server: ServerInstance;
+    let tools: string[];
+
+    before(async () => {
+      const port = await nextMcpPort();
+      server = await launchMcpServer(mockGitLabUrl, port, {
+        GITLAB_TOOLS: "list_pipelines,execute_graphql",
+      });
+      tools = await getToolNames(`http://${HOST}:${port}/mcp`);
+    });
+
+    after(() => cleanupServers([server]));
+
+    test("returns default tools plus list_pipelines and execute_graphql (both not in default toolsets)", () => {
+      assert.strictEqual(tools.length, DEFAULT_TOOL_COUNT + 2);
+    });
+
+    test("includes the individually added tools", () => {
+      assertContainsAll(tools, ["list_pipelines", "execute_graphql"], "individual");
+    });
+
+    test("excludes other pipeline tools (not individually enabled)", () => {
+      assertContainsNone(tools, ["create_pipeline", "cancel_pipeline"], "non-enabled pipelines");
+    });
+  });
+
+  // ---- 5. Toolset + individual tools combined ----
+
+  describe("GITLAB_TOOLSETS=issues + GITLAB_TOOLS=list_pipelines,get_pipeline", () => {
+    let server: ServerInstance;
+    let tools: string[];
+
+    before(async () => {
+      const port = await nextMcpPort();
+      server = await launchMcpServer(mockGitLabUrl, port, {
+        GITLAB_TOOLSETS: "issues",
+        GITLAB_TOOLS: "list_pipelines,get_pipeline",
+      });
+      tools = await getToolNames(`http://${HOST}:${port}/mcp`);
+    });
+
+    after(() => cleanupServers([server]));
+
+    test("returns issue tools + 2 individual pipeline tools + discover_tools", () => {
+      assert.strictEqual(tools.length, TOOLSET_TOOL_COUNTS.issues + 2 + DISCOVER_TOOLS_COUNT);
+    });
+
+    test("includes issue tools and the two pipeline tools", () => {
+      assertContainsAll(tools, TOOLSET_SAMPLE_TOOLS.issues, "issues");
+      assertContainsAll(tools, ["list_pipelines", "get_pipeline"], "individual");
+    });
+
+    test("excludes other pipeline tools", () => {
+      assertContainsNone(tools, ["create_pipeline", "cancel_pipeline"], "other pipelines");
+    });
+  });
+
+  // ---- 6. Legacy flag USE_PIPELINE as additive override ----
+
+  describe("GITLAB_TOOLSETS=issues + USE_PIPELINE=true", () => {
+    let server: ServerInstance;
+    let tools: string[];
+
+    before(async () => {
+      const port = await nextMcpPort();
+      server = await launchMcpServer(mockGitLabUrl, port, {
+        GITLAB_TOOLSETS: "issues",
+        USE_PIPELINE: "true",
+      });
+      tools = await getToolNames(`http://${HOST}:${port}/mcp`);
+    });
+
+    after(() => cleanupServers([server]));
+
+    test("returns issue tools + all pipeline tools + discover_tools", () => {
+      assert.strictEqual(
+        tools.length,
+        TOOLSET_TOOL_COUNTS.issues + LEGACY_PIPELINE_TOOL_COUNT + DISCOVER_TOOLS_COUNT
+      );
+    });
+
+    test("includes all pipeline tools via legacy flag", () => {
+      assertContainsAll(tools, TOOLSET_SAMPLE_TOOLS.pipelines, "pipelines");
+    });
+  });
+
+  // ---- 7. Legacy flag USE_GITLAB_WIKI ----
+
+  describe("USE_GITLAB_WIKI=true (no GITLAB_TOOLSETS)", () => {
+    let server: ServerInstance;
+    let tools: string[];
+
+    before(async () => {
+      const port = await nextMcpPort();
+      server = await launchMcpServer(mockGitLabUrl, port, {
+        USE_GITLAB_WIKI: "true",
+      });
+      tools = await getToolNames(`http://${HOST}:${port}/mcp`);
+    });
+
+    after(() => cleanupServers([server]));
+
+    test("returns default tools + wiki tools (wiki is NOT default, USE_GITLAB_WIKI adds it)", () => {
+      assert.strictEqual(tools.length, DEFAULT_TOOL_COUNT + TOOLSET_TOOL_COUNTS.wiki);
+    });
+
+    test("includes wiki tools", () => {
+      assertContainsAll(tools, TOOLSET_SAMPLE_TOOLS.wiki, "wiki");
+    });
+  });
+
+  // ---- 8. Read-only mode applied after toolset filter ----
+
+  describe("GITLAB_TOOLSETS=issues + GITLAB_READ_ONLY_MODE=true", () => {
+    let server: ServerInstance;
+    let tools: string[];
+
+    // Read-only issue tools (from readOnlyTools set in index.ts)
+    const readOnlyIssueTools = [
+      "list_issues",
+      "my_issues",
+      "get_issue",
+      "list_issue_links",
+      "list_issue_discussions",
+      "get_issue_link",
+      "list_todos",
+      "list_issue_emoji_reactions",
+      "list_issue_note_emoji_reactions",
+    ];
+
+    const writeIssueTools = [
+      "create_issue",
+      "update_issue",
+      "update_issue_description_patch",
+      "delete_issue",
+      "mark_todo_done",
+      "mark_all_todos_done",
+      "create_issue_note",
+      "update_issue_note",
+      "create_issue_link",
+      "delete_issue_link",
+      "create_note",
+      "create_issue_emoji_reaction",
+      "delete_issue_emoji_reaction",
+      "create_issue_note_emoji_reaction",
+      "delete_issue_note_emoji_reaction",
+    ];
+
+    before(async () => {
+      const port = await nextMcpPort();
+      server = await launchMcpServer(mockGitLabUrl, port, {
+        GITLAB_TOOLSETS: "issues",
+        GITLAB_READ_ONLY_MODE: "true",
+      });
+      tools = await getToolNames(`http://${HOST}:${port}/mcp`);
+    });
+
+    after(() => cleanupServers([server]));
+
+    test("includes only read-only issue tools", () => {
+      assertContainsAll(tools, readOnlyIssueTools, "read-only issues");
+    });
+
+    test("excludes write issue tools", () => {
+      assertContainsNone(tools, writeIssueTools, "write issues");
+    });
+
+    test("returns correct count (read-only issues + discover_tools)", () => {
+      assert.strictEqual(tools.length, readOnlyIssueTools.length + DISCOVER_TOOLS_COUNT);
+    });
+  });
+
+  // ---- 9. GITLAB_DENIED_TOOLS_REGEX applied after toolset filter ----
+
+  describe("GITLAB_TOOLSETS=issues + GITLAB_DENIED_TOOLS_REGEX=^(create_|delete_)", () => {
+    let server: ServerInstance;
+    let tools: string[];
+
+    before(async () => {
+      const port = await nextMcpPort();
+      server = await launchMcpServer(mockGitLabUrl, port, {
+        GITLAB_TOOLSETS: "issues",
+        GITLAB_DENIED_TOOLS_REGEX: "^(create_|delete_)",
+      });
+      tools = await getToolNames(`http://${HOST}:${port}/mcp`);
+    });
+
+    after(() => cleanupServers([server]));
+
+    test("excludes tools matching the denial regex", () => {
+      const denied = tools.filter(
+        (t) => t.startsWith("create_") || t.startsWith("delete_")
+      );
+      assert.strictEqual(denied.length, 0, `Should have no create_/delete_ tools, found: ${denied}`);
+    });
+
+    test("keeps non-matching issue tools", () => {
+      assertContainsAll(
+        tools,
+        ["list_issues", "my_issues", "get_issue", "update_issue", "update_issue_note"],
+        "non-denied issues"
+      );
+    });
+  });
+
+  // ---- 10. Full combination: toolset + individual + legacy + read-only ----
+
+  describe("GITLAB_TOOLSETS=issues + GITLAB_TOOLS=list_pipelines + USE_GITLAB_WIKI=true + GITLAB_READ_ONLY_MODE=true", () => {
+    let server: ServerInstance;
+    let tools: string[];
+
+    before(async () => {
+      const port = await nextMcpPort();
+      server = await launchMcpServer(mockGitLabUrl, port, {
+        GITLAB_TOOLSETS: "issues",
+        GITLAB_TOOLS: "list_pipelines",
+        USE_GITLAB_WIKI: "true",
+        GITLAB_READ_ONLY_MODE: "true",
+      });
+      tools = await getToolNames(`http://${HOST}:${port}/mcp`);
+    });
+
+    after(() => cleanupServers([server]));
+
+    test("includes read-only issue tools", () => {
+      assertContainsAll(tools, ["list_issues", "get_issue"], "read-only issues");
+    });
+
+    test("includes list_pipelines (read-only individual tool)", () => {
+      assertContainsAll(tools, ["list_pipelines"], "individual pipeline");
+    });
+
+    test("includes read-only wiki tools from legacy flag", () => {
+      assertContainsAll(tools, ["list_wiki_pages", "get_wiki_page"], "read-only wiki");
+    });
+
+    test("excludes write tools across all sources", () => {
+      assertContainsNone(
+        tools,
+        ["create_issue", "create_pipeline", "create_wiki_page"],
+        "write tools"
+      );
+    });
+  });
+
+  // ---- 11. Redundant legacy flag (toolset already includes it) ----
+
+  describe("GITLAB_TOOLSETS=pipelines + USE_PIPELINE=true (redundant)", () => {
+    let server: ServerInstance;
+    let tools: string[];
+
+    before(async () => {
+      const port = await nextMcpPort();
+      server = await launchMcpServer(mockGitLabUrl, port, {
+        GITLAB_TOOLSETS: "pipelines",
+        USE_PIPELINE: "true",
+      });
+      tools = await getToolNames(`http://${HOST}:${port}/mcp`);
+    });
+
+    after(() => cleanupServers([server]));
+
+    test("returns exactly pipeline tool count + discover_tools (no duplicates)", () => {
+      assert.strictEqual(tools.length, LEGACY_PIPELINE_TOOL_COUNT + DISCOVER_TOOLS_COUNT);
+    });
+  });
+
+  // ---- 12. GITLAB_TOOLS with tool already in enabled toolset (no dupes) ----
+
+  describe("GITLAB_TOOLSETS=issues + GITLAB_TOOLS=list_issues (already included)", () => {
+    let server: ServerInstance;
+    let tools: string[];
+
+    before(async () => {
+      const port = await nextMcpPort();
+      server = await launchMcpServer(mockGitLabUrl, port, {
+        GITLAB_TOOLSETS: "issues",
+        GITLAB_TOOLS: "list_issues",
+      });
+      tools = await getToolNames(`http://${HOST}:${port}/mcp`);
+    });
+
+    after(() => cleanupServers([server]));
+
+    test("returns exactly issue tool count + discover_tools (no duplicates)", () => {
+      assert.strictEqual(tools.length, TOOLSET_TOOL_COUNTS.issues + DISCOVER_TOOLS_COUNT);
+    });
+  });
+
+  // ---- 13. Invalid toolset ID is silently ignored ----
+
+  describe("GITLAB_TOOLSETS=issues,nonexistent_toolset", () => {
+    let server: ServerInstance;
+    let tools: string[];
+
+    before(async () => {
+      const port = await nextMcpPort();
+      server = await launchMcpServer(mockGitLabUrl, port, {
+        GITLAB_TOOLSETS: "issues,nonexistent_toolset",
+      });
+      tools = await getToolNames(`http://${HOST}:${port}/mcp`);
+    });
+
+    after(() => cleanupServers([server]));
+
+    test("returns only issue tools + discover_tools (invalid toolset ignored)", () => {
+      assert.strictEqual(tools.length, TOOLSET_TOOL_COUNTS.issues + DISCOVER_TOOLS_COUNT);
+    });
+  });
+
+  // ---- 14. GITLAB_TOOLS case-insensitive matching ----
+
+  describe("GITLAB_TOOLS with mixed-case tool names", () => {
+    let server: ServerInstance;
+    let tools: string[];
+
+    before(async () => {
+      const port = await nextMcpPort();
+      server = await launchMcpServer(mockGitLabUrl, port, {
+        GITLAB_TOOLS: "List_Pipelines,Execute_GraphQL",
+      });
+      tools = await getToolNames(`http://${HOST}:${port}/mcp`);
+    });
+
+    after(() => cleanupServers([server]));
+
+    test("resolves mixed-case tool names to lowercase equivalents", () => {
+      assertContainsAll(tools, ["list_pipelines", "execute_graphql"], "case-insensitive tools");
+    });
+
+    test("returns default tools plus list_pipelines and execute_graphql", () => {
+      assert.strictEqual(tools.length, DEFAULT_TOOL_COUNT + 2);
+    });
+  });
+
+  // ---- 15. GITLAB_TOOLS with unknown tool names ----
+
+  describe("GITLAB_TOOLS with unknown tool names", () => {
+    let server: ServerInstance;
+    let tools: string[];
+
+    before(async () => {
+      const port = await nextMcpPort();
+      server = await launchMcpServer(mockGitLabUrl, port, {
+        GITLAB_TOOLS: "list_pipelines,nonexistent_tool_xyz",
+      });
+      tools = await getToolNames(`http://${HOST}:${port}/mcp`);
+    });
+
+    after(() => cleanupServers([server]));
+
+    test("server starts normally and returns tools without crashing", () => {
+      assert.ok(tools.length > 0, "Should return at least some tools");
+    });
+
+    test("includes the valid individual tool but ignores the unknown one", () => {
+      assertContainsAll(tools, ["list_pipelines"], "valid individual tool");
+      assertContainsNone(tools, ["nonexistent_tool_xyz"], "unknown tool");
+    });
+  });
+});

@@ -1,0 +1,28 @@
+node_modules
+.DS_Store
+build
+.local/
+.env
+.env.local
+.env.test
+coverage/
+*.log
+# ai
+.opencode*
+.aider*
+.sisyphus
+test-results*.json
+docs/plans/
+.codex
+
+# AI agent worktrees (local development only)
+.claude/worktrees/
+# OpenWolf local context (session notes, anatomy, memory)
+.wolf/
+
+# MkDocs build artifacts
+site/
+.venv-docs/
+
+# Power BI export artifacts
+powerbi_*.csv
